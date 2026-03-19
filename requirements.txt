@@ -1,6 +1,4 @@
 flask
-py_clob_client
 requests
 gunicorn
 eth-account
-web3

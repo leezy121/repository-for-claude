@@ -1,4 +1,2 @@
 flask
-requests
 gunicorn
-eth-account

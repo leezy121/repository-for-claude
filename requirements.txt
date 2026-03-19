@@ -1,3 +1,4 @@
 flask
 py_clob_client
 requests
+gunicorn

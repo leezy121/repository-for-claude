@@ -1,158 +1,165 @@
 from flask import Flask, request, jsonify
-import os, requests, json, time, traceback
-from eth_account import Account
-from eth_account.messages import encode_defunct
-import hashlib, hmac, base64
+import os, json, time, traceback, hashlib, hmac, base64
+from urllib.request import urlopen, Request
+from urllib.error import URLError
 
 app = Flask(__name__)
 
-CLOB_HOST = "https://clob.polymarket.com"
-API_KEY = os.environ.get("POLY_API_KEY", "")
-API_SECRET = os.environ.get("POLY_API_SECRET", "")
-API_PASSPHRASE = os.environ.get("POLY_PASSPHRASE", "")
+CLOB_HOST   = "https://clob.polymarket.com"
+API_KEY     = os.environ.get("POLY_API_KEY", "")
+API_SECRET  = os.environ.get("POLY_API_SECRET", "")
+PASSPHRASE  = os.environ.get("POLY_PASSPHRASE", "")
 PRIVATE_KEY = os.environ.get("POLY_PRIVATE_KEY", "")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+WEBHOOK_SEC = os.environ.get("WEBHOOK_SECRET", "")
 
-def get_auth_headers(method, path, body=""):
-    timestamp = str(int(time.time()))
-    message = timestamp + method.upper() + path + (body or "")
-    secret_bytes = base64.b64decode(API_SECRET + "==")
-    signature = base64.b64encode(
-        hmac.new(secret_bytes, message.encode("utf-8"), hashlib.sha256).digest()
-    ).decode("utf-8")
+
+def sign(method, path, body=""):
+    ts  = str(int(time.time()))
+    msg = ts + method.upper() + path + (body or "")
+    try:
+        secret = base64.b64decode(API_SECRET + "==")
+    except Exception:
+        secret = API_SECRET.encode()
+    sig = base64.b64encode(
+        hmac.new(secret, msg.encode(), hashlib.sha256).digest()
+    ).decode()
     return {
-        "POLY-API-KEY": API_KEY,
-        "POLY-SIGNATURE": signature,
-        "POLY-TIMESTAMP": timestamp,
-        "POLY-PASSPHRASE": API_PASSPHRASE,
-        "Content-Type": "application/json"
+        "POLY-API-KEY":    API_KEY,
+        "POLY-SIGNATURE":  sig,
+        "POLY-TIMESTAMP":  ts,
+        "POLY-PASSPHRASE": PASSPHRASE,
+        "Content-Type":    "application/json"
     }
 
-def check_secret(req):
-    return req.headers.get("X-Webhook-Secret", "") == WEBHOOK_SECRET
 
-@app.route("/health", methods=["GET"])
+def http_get(path):
+    headers = sign("GET", path)
+    req = Request(CLOB_HOST + path, headers=headers)
+    with urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode())
+
+
+def http_post(path, payload):
+    body    = json.dumps(payload)
+    headers = sign("POST", path, body)
+    req     = Request(
+        CLOB_HOST + path,
+        data=body.encode(),
+        headers=headers,
+        method="POST"
+    )
+    with urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode())
+
+
+def auth_ok(req):
+    return req.headers.get("X-Webhook-Secret", "") == WEBHOOK_SEC
+
+
+@app.route("/health")
 def health():
     return jsonify({
-        "status": "ok",
-        "clob_available": True,
-        "message": "Leez Polymarket executor is running",
-        "api_key_set": bool(API_KEY),
+        "status":          "ok",
+        "clob_available":  True,
+        "message":         "Leez Polymarket executor is running",
+        "api_key_set":     bool(API_KEY),
         "private_key_set": bool(PRIVATE_KEY)
     })
 
-@app.route("/trade", methods=["POST"])
-def place_trade():
-    if not check_secret(request):
-        return jsonify({"error": "Unauthorized"}), 401
 
+@app.route("/trade", methods=["POST"])
+def trade():
+    if not auth_ok(request):
+        return jsonify({"error": "Unauthorized"}), 401
     try:
-        data = request.get_json(force=True, silent=True)
-if isinstance(data, str):
-    import json
-    data = json.loads(data)
-if not data:
-    return jsonify({"error": "Invalid JSON body"}), 400
-        token_id = data.get("token_id")
-        price    = float(data.get("price", 0))
-        size     = float(data.get("size", 0))
-        side     = data.get("side", "BUY")
-        market_id = data.get("market_id", "")
-        question  = data.get("question", "")
+        # Parse body safely regardless of content-type
+        raw = request.get_data(as_text=True)
+        try:
+            d = json.loads(raw)
+        except Exception:
+            d = request.get_json(force=True, silent=True) or {}
+
+        token_id  = d.get("token_id", "")
+        price     = float(d.get("price", 0))
+        size      = float(d.get("size", 0))
+        side      = d.get("side", "BUY")
+        market_id = d.get("market_id", "")
+        question  = d.get("question", "")
 
         # Safety limits
         size = min(size, 0.40)
         if size < 0.10:
             return jsonify({"error": f"Size ${size} too small (min $0.10)"}), 400
-
         if not token_id or not price:
             return jsonify({"error": "Missing token_id or price"}), 400
 
-        # Build order payload
         order = {
-            "orderType": "GTC",
-            "tokenID": token_id,
-            "price": str(price),
-            "size": str(size),
-            "side": side,
+            "orderType":  "GTC",
+            "tokenID":    token_id,
+            "price":      str(round(price, 4)),
+            "size":       str(round(size, 2)),
+            "side":       side,
             "feeRateBps": "0",
-            "nonce": str(int(time.time() * 1000)),
+            "nonce":      str(int(time.time() * 1000)),
             "expiration": "0"
         }
 
-        order_json = json.dumps(order)
-        path = "/order"
-        headers = get_auth_headers("POST", path, order_json)
-
-        response = requests.post(
-            CLOB_HOST + path,
-            headers=headers,
-            data=order_json,
-            timeout=15
-        )
-
-        result = response.json()
-
+        result = http_post("/order", order)
         return jsonify({
-            "success": response.status_code == 200,
-            "order_id": result.get("orderID", result.get("id", "unknown")),
-            "status": result.get("status", "submitted"),
+            "success":   True,
+            "order_id":  result.get("orderID", result.get("id", "unknown")),
+            "status":    result.get("status", "submitted"),
             "market_id": market_id,
-            "question": question,
-            "size": size,
-            "price": price,
-            "raw": result
+            "question":  question,
+            "size":      size,
+            "price":     price
         })
 
     except Exception as e:
         return jsonify({
             "success": False,
-            "error": str(e),
-            "trace": traceback.format_exc()
+            "error":   str(e),
+            "trace":   traceback.format_exc()
         }), 500
 
 
 @app.route("/outcome", methods=["POST"])
-def check_outcome():
-    if not check_secret(request):
+def outcome():
+    if not auth_ok(request):
         return jsonify({"error": "Unauthorized"}), 401
-
     try:
-        data = request.get_json()
-        market_id = data.get("market_id")
+        raw = request.get_data(as_text=True)
+        try:
+            d = json.loads(raw)
+        except Exception:
+            d = request.get_json(force=True, silent=True) or {}
+
+        market_id = d.get("market_id", "")
         if not market_id:
             return jsonify({"error": "market_id required"}), 400
 
-        path = f"/markets/{market_id}"
-        headers = get_auth_headers("GET", path)
-        response = requests.get(CLOB_HOST + path, headers=headers, timeout=15)
-        market = response.json()
-
+        market   = http_get(f"/markets/{market_id}")
         resolved = market.get("closed", False)
-        outcome = None
+        outcome  = None
         if resolved:
             for t in market.get("tokens", []):
                 if float(t.get("price", 0)) >= 0.99:
-                    outcome = t.get("outcome", "Unknown")
-
+                    outcome = t.get("outcome")
         return jsonify({
             "market_id": market_id,
-            "question": market.get("question", ""),
-            "resolved": resolved,
-            "outcome": outcome
+            "question":  market.get("question", ""),
+            "resolved":  resolved,
+            "outcome":   outcome
         })
 
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-@app.route("/balance", methods=["GET"])
-def get_balance():
+@app.route("/balance")
+def balance():
     try:
-        path = "/balance-allowance?asset_type=USDC"
-        headers = get_auth_headers("GET", path)
-        response = requests.get(CLOB_HOST + path, headers=headers, timeout=15)
-        return jsonify(response.json())
+        return jsonify(http_get("/balance-allowance?asset_type=USDC"))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

@@ -47,7 +47,12 @@ def place_trade():
         return jsonify({"error": "Unauthorized"}), 401
 
     try:
-        data = request.get_json()
+        data = request.get_json(force=True, silent=True)
+if isinstance(data, str):
+    import json
+    data = json.loads(data)
+if not data:
+    return jsonify({"error": "Invalid JSON body"}), 400
         token_id = data.get("token_id")
         price    = float(data.get("price", 0))
         size     = float(data.get("size", 0))

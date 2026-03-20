@@ -67,7 +67,10 @@ def build_and_sign_order(token_id, price, size, side):
     if not ETH_OK:
         raise Exception("eth_account not available")
 
-    account = Account.from_key(PRIVATE_KEY)
+    pk = PRIVATE_KEY.strip()
+if not pk.startswith("0x"):
+    pk = "0x" + pk
+account = Account.from_key(pk)
 
     # Order struct for Polymarket CTF Exchange
     order = {

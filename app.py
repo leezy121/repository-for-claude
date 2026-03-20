@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify
 import os, json, time, traceback, hashlib, hmac, base64
 from urllib.request import urlopen, Request
-from urllib.error import URLError
 
 app = Flask(__name__)
 
@@ -12,8 +11,32 @@ PASSPHRASE  = os.environ.get("POLY_PASSPHRASE", "")
 PRIVATE_KEY = os.environ.get("POLY_PRIVATE_KEY", "")
 WEBHOOK_SEC = os.environ.get("WEBHOOK_SECRET", "")
 
+# Try importing eth_account for EIP-712 signing
+try:
+    from eth_account import Account
+    from eth_account.messages import encode_defunct
+    ETH_OK = True
+except ImportError:
+    ETH_OK = False
 
-def sign(method, path, body=""):
+
+def auth_ok(req):
+    return req.headers.get("X-Webhook-Secret", "") == WEBHOOK_SEC
+
+
+def parse_body(req):
+    raw = req.get_data(as_text=True)
+    try:
+        d = json.loads(raw)
+        if isinstance(d, str):
+            d = json.loads(d)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return req.get_json(force=True, silent=True) or {}
+
+
+def get_api_headers(method, path, body=""):
+    """HMAC headers for read-only API calls"""
     ts  = str(int(time.time()))
     msg = ts + method.upper() + path + (body or "")
     try:
@@ -33,38 +56,77 @@ def sign(method, path, body=""):
 
 
 def http_get(path):
-    headers = sign("GET", path)
+    headers = get_api_headers("GET", path)
     req = Request(CLOB_HOST + path, headers=headers)
     with urlopen(req, timeout=15) as r:
         return json.loads(r.read().decode())
 
 
-def http_post(path, payload):
-    body    = json.dumps(payload)
-    headers = sign("POST", path, body)
-    req     = Request(
-        CLOB_HOST + path,
-        data=body.encode(),
-        headers=headers,
-        method="POST"
+def build_and_sign_order(token_id, price, size, side):
+    """Build and sign order using EIP-712"""
+    if not ETH_OK:
+        raise Exception("eth_account not available")
+
+    account = Account.from_key(PRIVATE_KEY)
+
+    # Order struct for Polymarket CTF Exchange
+    order = {
+        "salt":        int(time.time() * 1000),
+        "maker":       account.address,
+        "signer":      account.address,
+        "taker":       "0x0000000000000000000000000000000000000000",
+        "tokenId":     int(token_id),
+        "makerAmount": int(float(size) * 1e6),  # USDC has 6 decimals
+        "takerAmount": int(float(size) * float(price) * 1e6),
+        "expiration":  0,
+        "nonce":       0,
+        "feeRateBps":  0,
+        "side":        0 if side == "BUY" else 1,
+        "signatureType": 0
+    }
+
+    # EIP-712 domain for Polymarket
+    domain = {
+        "name":              "CTF Exchange",
+        "version":           "1",
+        "chainId":           137,  # Polygon
+        "verifyingContract": "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+    }
+
+    types = {
+        "Order": [
+            {"name": "salt",          "type": "uint256"},
+            {"name": "maker",         "type": "address"},
+            {"name": "signer",        "type": "address"},
+            {"name": "taker",         "type": "address"},
+            {"name": "tokenId",       "type": "uint256"},
+            {"name": "makerAmount",   "type": "uint256"},
+            {"name": "takerAmount",   "type": "uint256"},
+            {"name": "expiration",    "type": "uint256"},
+            {"name": "nonce",         "type": "uint256"},
+            {"name": "feeRateBps",    "type": "uint256"},
+            {"name": "side",          "type": "uint8"},
+            {"name": "signatureType", "type": "uint8"}
+        ]
+    }
+
+    # Sign the order
+    structured_data = {
+        "types":       types,
+        "domain":      domain,
+        "primaryType": "Order",
+        "message":     order
+    }
+
+    signed = Account.sign_typed_data(
+        account.key,
+        domain_data=domain,
+        message_types={"Order": types["Order"]},
+        message_data=order
     )
-    with urlopen(req, timeout=15) as r:
-        return json.loads(r.read().decode())
 
-
-def auth_ok(req):
-    return req.headers.get("X-Webhook-Secret", "") == WEBHOOK_SEC
-
-
-def parse_body(req):
-    raw = req.get_data(as_text=True)
-    try:
-        d = json.loads(raw)
-        if isinstance(d, str):
-            d = json.loads(d)
-        return d if isinstance(d, dict) else {}
-    except Exception:
-        return req.get_json(force=True, silent=True) or {}
+    order["signature"] = signed.signature.hex()
+    return order
 
 
 @app.route("/health")
@@ -72,6 +134,7 @@ def health():
     return jsonify({
         "status":          "ok",
         "clob_available":  True,
+        "eth_account_ok":  ETH_OK,
         "message":         "Leez Polymarket executor is running",
         "api_key_set":     bool(API_KEY),
         "private_key_set": bool(PRIVATE_KEY)
@@ -93,22 +156,42 @@ def trade():
 
         size = min(size, 1.60)
         if size < 0.10:
-            return jsonify({"error": f"Size ${size} too small (min $0.10)"}), 400
+            return jsonify({"error": f"Size ${size} too small"}), 400
         if not token_id or not price:
             return jsonify({"error": "Missing token_id or price"}), 400
 
-        order = {
-            "orderType":  "GTC",
-            "tokenID":    token_id,
-            "price":      str(round(price, 4)),
-            "size":       str(round(size, 2)),
-            "side":       side,
-            "feeRateBps": "0",
-            "nonce":      str(int(time.time() * 1000)),
-            "expiration": "0"
+        # Build signed order
+        signed_order = build_and_sign_order(token_id, price, size, side)
+
+        # Post to Polymarket
+        ts  = str(int(time.time()))
+        msg = ts + "POST" + "/order" + json.dumps(signed_order)
+        try:
+            secret = base64.b64decode(API_SECRET + "==")
+        except Exception:
+            secret = API_SECRET.encode()
+        sig = base64.b64encode(
+            hmac.new(secret, msg.encode(), hashlib.sha256).digest()
+        ).decode()
+
+        headers = {
+            "POLY-API-KEY":    API_KEY,
+            "POLY-SIGNATURE":  sig,
+            "POLY-TIMESTAMP":  ts,
+            "POLY-PASSPHRASE": PASSPHRASE,
+            "Content-Type":    "application/json"
         }
 
-        result = http_post("/order", order)
+        body    = json.dumps({"order": signed_order, "orderType": "GTC"})
+        req_obj = Request(
+            CLOB_HOST + "/order",
+            data=body.encode(),
+            headers=headers,
+            method="POST"
+        )
+        with urlopen(req_obj, timeout=15) as r:
+            result = json.loads(r.read().decode())
+
         return jsonify({
             "success":   True,
             "order_id":  result.get("orderID", result.get("id", "unknown")),

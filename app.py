@@ -1,110 +1,88 @@
 from flask import Flask, request, jsonify
-import os, json, time, traceback, hashlib, hmac, base64
-from urllib.request import urlopen, Request
-from urllib.error import URLError
+import os, json, time, traceback
 
 app = Flask(__name__)
 
-CLOB_HOST   = "https://clob.polymarket.com"
+WEBHOOK_SEC = os.environ.get("WEBHOOK_SECRET", "")
+PRIVATE_KEY = os.environ.get("POLY_PRIVATE_KEY", "")
 API_KEY     = os.environ.get("POLY_API_KEY", "")
 API_SECRET  = os.environ.get("POLY_API_SECRET", "")
 PASSPHRASE  = os.environ.get("POLY_PASSPHRASE", "")
-PRIVATE_KEY = os.environ.get("POLY_PRIVATE_KEY", "")
-WEBHOOK_SEC = os.environ.get("WEBHOOK_SECRET", "")
 
+try:
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import OrderArgs, OrderType, Side
+    from py_clob_client.constants import POLYGON
+    CLOB_OK = True
+except ImportError:
+    CLOB_OK = False
 
-def sign(method, path, body=""):
-    ts  = str(int(time.time()))
-    msg = ts + method.upper() + path + (body or "")
-    try:
-        secret = base64.b64decode(API_SECRET + "==")
-    except Exception:
-        secret = API_SECRET.encode()
-    sig = base64.b64encode(
-        hmac.new(secret, msg.encode(), hashlib.sha256).digest()
-    ).decode()
-    return {
-        "POLY-API-KEY":    API_KEY,
-        "POLY-SIGNATURE":  sig,
-        "POLY-TIMESTAMP":  ts,
-        "POLY-PASSPHRASE": PASSPHRASE,
-        "Content-Type":    "application/json"
-    }
-
-
-def http_get(path):
-    headers = sign("GET", path)
-    req = Request(CLOB_HOST + path, headers=headers)
-    with urlopen(req, timeout=15) as r:
-        return json.loads(r.read().decode())
-
-
-def http_post(path, payload):
-    body    = json.dumps(payload)
-    headers = sign("POST", path, body)
-    req     = Request(
-        CLOB_HOST + path,
-        data=body.encode(),
-        headers=headers,
-        method="POST"
+def get_client():
+    return ClobClient(
+        host="https://clob.polymarket.com",
+        chain_id=POLYGON,
+        key=PRIVATE_KEY,
+        creds={
+            "apiKey":     API_KEY,
+            "secret":     API_SECRET,
+            "passphrase": PASSPHRASE,
+        }
     )
-    with urlopen(req, timeout=15) as r:
-        return json.loads(r.read().decode())
-
 
 def auth_ok(req):
     return req.headers.get("X-Webhook-Secret", "") == WEBHOOK_SEC
 
+def parse_body(req):
+    raw = req.get_data(as_text=True)
+    try:
+        d = json.loads(raw)
+        if isinstance(d, str):
+            d = json.loads(d)
+        return d
+    except Exception:
+        return req.get_json(force=True, silent=True) or {}
 
 @app.route("/health")
 def health():
     return jsonify({
         "status":          "ok",
-        "clob_available":  True,
+        "clob_available":  CLOB_OK,
         "message":         "Leez Polymarket executor is running",
         "api_key_set":     bool(API_KEY),
         "private_key_set": bool(PRIVATE_KEY)
     })
 
-
 @app.route("/trade", methods=["POST"])
 def trade():
     if not auth_ok(request):
         return jsonify({"error": "Unauthorized"}), 401
+    if not CLOB_OK:
+        return jsonify({"error": "py_clob_client not installed"}), 500
     try:
-        # Parse body safely regardless of content-type
-        raw = request.get_data(as_text=True)
-        try:
-            d = json.loads(raw)
-        except Exception:
-            d = request.get_json(force=True, silent=True) or {}
-
-        token_id  = d.get("token_id", "")
+        d         = parse_body(request)
+        token_id  = str(d.get("token_id", ""))
         price     = float(d.get("price", 0))
         size      = float(d.get("size", 0))
-        side      = d.get("side", "BUY")
         market_id = d.get("market_id", "")
         question  = d.get("question", "")
 
         # Safety limits
-        size = min(size, 0.40)
+        size = min(size, 1.60)  # max 20% of $8
         if size < 0.10:
-            return jsonify({"error": f"Size ${size} too small (min $0.10)"}), 400
+            return jsonify({"error": f"Size ${size} too small"}), 400
         if not token_id or not price:
             return jsonify({"error": "Missing token_id or price"}), 400
 
-        order = {
-            "orderType":  "GTC",
-            "tokenID":    token_id,
-            "price":      str(round(price, 4)),
-            "size":       str(round(size, 2)),
-            "side":       side,
-            "feeRateBps": "0",
-            "nonce":      str(int(time.time() * 1000)),
-            "expiration": "0"
-        }
+        client = get_client()
+        order_args = OrderArgs(
+            token_id=token_id,
+            price=price,
+            size=size,
+            side=Side.BUY,
+        )
+        signed_order = client.create_order(order_args)
+        result       = client.post_order(signed_order, OrderType.GTC)
 
-        result = http_post("/order", order)
         return jsonify({
             "success":   True,
             "order_id":  result.get("orderID", result.get("id", "unknown")),
@@ -112,7 +90,8 @@ def trade():
             "market_id": market_id,
             "question":  question,
             "size":      size,
-            "price":     price
+            "price":     price,
+            "raw":       result
         })
 
     except Exception as e:
@@ -122,23 +101,20 @@ def trade():
             "trace":   traceback.format_exc()
         }), 500
 
-
 @app.route("/outcome", methods=["POST"])
 def outcome():
     if not auth_ok(request):
         return jsonify({"error": "Unauthorized"}), 401
+    if not CLOB_OK:
+        return jsonify({"error": "py_clob_client not installed"}), 500
     try:
-        raw = request.get_data(as_text=True)
-        try:
-            d = json.loads(raw)
-        except Exception:
-            d = request.get_json(force=True, silent=True) or {}
-
+        d         = parse_body(request)
         market_id = d.get("market_id", "")
         if not market_id:
             return jsonify({"error": "market_id required"}), 400
 
-        market   = http_get(f"/markets/{market_id}")
+        client   = get_client()
+        market   = client.get_market(market_id)
         resolved = market.get("closed", False)
         outcome  = None
         if resolved:
@@ -155,14 +131,15 @@ def outcome():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-
 @app.route("/balance")
 def balance():
+    if not CLOB_OK:
+        return jsonify({"error": "py_clob_client not installed"}), 500
     try:
-        return jsonify(http_get("/balance-allowance?asset_type=USDC"))
+        client = get_client()
+        return jsonify(client.get_balance())
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
